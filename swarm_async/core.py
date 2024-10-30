@@ -3,6 +3,8 @@ import copy
 import json
 from collections import defaultdict
 from typing import List, Callable, Union
+import asyncio
+from inspect import iscoroutinefunction
 
 # Package/library imports
 from openai import OpenAI
@@ -68,11 +70,13 @@ class Swarm:
 
         return self.client.chat.completions.create(**create_params)
 
-    def handle_function_result(self, result, debug) -> Result:
+    async def handle_function_result(self, result, debug) -> Result:
+        if asyncio.iscoroutine(result):
+            result = await result
+        
         match result:
             case Result() as result:
                 return result
-
             case Agent() as agent:
                 return Result(
                     value=json.dumps({"assistant": agent.name}),
@@ -86,7 +90,7 @@ class Swarm:
                     debug_print(debug, error_message)
                     raise TypeError(error_message)
 
-    def handle_tool_calls(
+    async def handle_tool_calls(
         self,
         tool_calls: List[ChatCompletionMessageToolCall],
         functions: List[AgentFunction],
@@ -94,12 +98,10 @@ class Swarm:
         debug: bool,
     ) -> Response:
         function_map = {f.__name__: f for f in functions}
-        partial_response = Response(
-            messages=[], agent=None, context_variables={})
+        partial_response = Response(messages=[], agent=None, context_variables={})
 
         for tool_call in tool_calls:
             name = tool_call.function.name
-            # handle missing tool case, skip to next tool
             if name not in function_map:
                 debug_print(debug, f"Tool {name} not found in function map.")
                 partial_response.messages.append(
@@ -111,17 +113,22 @@ class Swarm:
                     }
                 )
                 continue
+            
             args = json.loads(tool_call.function.arguments)
-            debug_print(
-                debug, f"Processing tool call: {name} with arguments {args}")
+            debug_print(debug, f"Processing tool call: {name} with arguments {args}")
 
             func = function_map[name]
-            # pass context_variables to agent functions
             if __CTX_VARS_NAME__ in func.__code__.co_varnames:
                 args[__CTX_VARS_NAME__] = context_variables
-            raw_result = function_map[name](**args)
-
-            result: Result = self.handle_function_result(raw_result, debug)
+            
+            # Check if the function is async and handle accordingly
+            if iscoroutinefunction(func):
+                raw_result = await func(**args)
+            else:
+                raw_result = func(**args)
+                
+            result: Result = await self.handle_function_result(raw_result, debug)
+            
             partial_response.messages.append(
                 {
                     "role": "tool",
@@ -136,7 +143,7 @@ class Swarm:
 
         return partial_response
 
-    def run_and_stream(
+    async def run_and_stream(
         self,
         agent: Agent,
         messages: List,
@@ -152,7 +159,6 @@ class Swarm:
         init_len = len(messages)
 
         while len(history) - init_len < max_turns:
-
             message = {
                 "content": "",
                 "sender": agent.name,
@@ -177,8 +183,11 @@ class Swarm:
                 debug=debug,
             )
 
+            await asyncio.sleep(0)  # Allow other tasks to run
             yield {"delim": "start"}
+            
             for chunk in completion:
+                await asyncio.sleep(0)  # Allow other tasks to run
                 delta = json.loads(chunk.choices[0].delta.json())
                 if delta["role"] == "assistant":
                     delta["sender"] = active_agent.name
@@ -186,10 +195,10 @@ class Swarm:
                 delta.pop("role", None)
                 delta.pop("sender", None)
                 merge_chunk(message, delta)
+                
             yield {"delim": "end"}
 
-            message["tool_calls"] = list(
-                message.get("tool_calls", {}).values())
+            message["tool_calls"] = list(message.get("tool_calls", {}).values())
             if not message["tool_calls"]:
                 message["tool_calls"] = None
             debug_print(debug, "Received completion:", message)
@@ -212,7 +221,7 @@ class Swarm:
                 tool_calls.append(tool_call_object)
 
             # handle function calls, updating context_variables, and switching agents
-            partial_response = self.handle_tool_calls(
+            partial_response = await self.handle_tool_calls(
                 tool_calls, active_agent.functions, context_variables, debug
             )
             history.extend(partial_response.messages)
@@ -228,7 +237,7 @@ class Swarm:
             )
         }
 
-    def run(
+    async def run(
         self,
         agent: Agent,
         messages: List,
@@ -277,7 +286,7 @@ class Swarm:
                 break
 
             # handle function calls, updating context_variables, and switching agents
-            partial_response = self.handle_tool_calls(
+            partial_response = await self.handle_tool_calls(
                 message.tool_calls, active_agent.functions, context_variables, debug
             )
             history.extend(partial_response.messages)

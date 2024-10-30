@@ -1,6 +1,6 @@
 import json
 
-from swarm import Swarm
+from swarm_async.swarm_async import Swarm
 
 
 def process_and_print_streaming_response(response):
@@ -57,7 +57,7 @@ def pretty_print_messages(messages) -> None:
             print(f"\033[95m{name}\033[0m({arg_str[1:-1]})")
 
 
-def run_demo_loop(
+async def run_demo_loop(
     starting_agent, context_variables=None, stream=False, debug=False
 ) -> None:
     client = Swarm()
@@ -67,21 +67,43 @@ def run_demo_loop(
     agent = starting_agent
 
     while True:
+        print()  # Add a newline before the prompt
         user_input = input("\033[90mUser\033[0m: ")
         messages.append({"role": "user", "content": user_input})
 
-        response = client.run(
-            agent=agent,
-            messages=messages,
-            context_variables=context_variables or {},
-            stream=stream,
-            debug=debug,
-        )
-
         if stream:
-            response = process_and_print_streaming_response(response)
+            response = None
+            stream_generator = await client.run(
+                agent=agent,
+                messages=messages,
+                context_variables=context_variables or {},
+                stream=stream,
+                debug=debug,
+            )
+            
+            try:
+                while True:
+                    chunk = await anext(stream_generator)
+                    if "response" in chunk:
+                        response = chunk["response"]
+                        break
+                    else:
+                        process_and_print_streaming_response([chunk])
+            except StopAsyncIteration:
+                pass
+            except Exception as e:
+                print(f"Error in streaming: {str(e)}")
+                continue
         else:
+            response = await client.run(
+                agent=agent,
+                messages=messages,
+                context_variables=context_variables or {},
+                stream=stream,
+                debug=debug,
+            )
             pretty_print_messages(response.messages)
 
-        messages.extend(response.messages)
-        agent = response.agent
+        if response:
+            messages.extend(response.messages)
+            agent = response.agent or agent
